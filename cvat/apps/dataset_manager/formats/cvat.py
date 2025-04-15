@@ -115,7 +115,7 @@ class CvatExtractor(DatasetBase):
                     items[(subset, name)] = DatasetItem(
                         id=name,
                         annotations=[],
-                        media=Image(path=file),
+                        media=Image.from_file(path=file),
                         subset=subset or DEFAULT_SUBSET_NAME,
                     )
 
@@ -617,7 +617,7 @@ class CvatExtractor(DatasetBase):
             )
             image_size = (item_desc.get("height"), item_desc.get("width"))
             if all(image_size):
-                image = Image(path=image, size=tuple(map(int, image_size)))
+                image = Image.from_file(path=image, size=tuple(map(int, image_size)))
             di = image_items.get(
                 (subset, osp.splitext(name)[0]), DatasetItem(id=name, annotations=[])
             )
@@ -1341,7 +1341,7 @@ def load_anno(file_object, annotations):
                         DatasetItem(
                             id=osp.splitext(el.attrib["name"])[0],
                             attributes={"frame": el.attrib["id"]},
-                            media=Image(path=el.attrib["name"]),
+                            media=Image.from_file(path=el.attrib["name"]),
                         ),
                         instance_data=annotations,
                     )
@@ -1618,7 +1618,7 @@ def _export_project(
         dump_project_anno(f, project_data, anno_callback)
 
     if save_images:
-        for task_data in project_data.task_data:
+        for task_data in project_data.all_task_data:
             subset = get_defaulted_subset(task_data.db_instance.subset, project_data.subsets)
             subset_dir = osp.join(temp_dir, "images", subset)
             os.makedirs(subset_dir, exist_ok=True)
@@ -1674,8 +1674,8 @@ def _import(src_file, temp_dir, instance_data, load_data_callback=None, **kwargs
     if is_zip:
         zipfile.ZipFile(src_file).extractall(temp_dir)
 
+        detect_dataset(temp_dir, format_name="cvat", importer=_CvatImporter)
         if isinstance(instance_data, ProjectData):
-            detect_dataset(temp_dir, format_name="cvat", importer=_CvatImporter)
             dataset = Dataset.import_from(temp_dir, "cvat", env=dm_env)
             if load_data_callback is not None:
                 load_data_callback(dataset, instance_data)
