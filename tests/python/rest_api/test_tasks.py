@@ -26,7 +26,6 @@ from typing import Any, Optional
 
 import numpy as np
 import pytest
-from attr.converters import to_bool
 from cvat_sdk import exceptions
 from cvat_sdk.api_client import models
 from cvat_sdk.api_client.api_client import ApiClient, Endpoint
@@ -439,6 +438,16 @@ class TestPostTasks:
             else:
                 assert task.assignee is None
                 assert task.assignee_updated_date is None
+
+    def test_can_create_without_labels(self, admin_user):
+        task_spec = {"name": "test task without labels"}
+
+        with make_api_client(admin_user) as api_client:
+            (task, _) = api_client.tasks_api.create(task_write_request=task_spec)
+
+            (labels, _) = api_client.labels_api.list(task_id=task.id)
+
+            assert labels.count == 0
 
 
 @pytest.mark.usefixtures("restore_db_per_class")
@@ -1192,12 +1201,12 @@ class TestWorkWithTask:
     @pytest.mark.with_external_services
     @pytest.mark.parametrize(
         "cloud_storage_id, manifest",
-        [(1, "manifest.jsonl")],  # public bucket
+        [(1, "images_with_manifest/manifest.jsonl")],  # public bucket
     )
     def test_work_with_task_containing_non_stable_cloud_storage_files(
         self, cloud_storage_id, manifest, cloud_storages, request
     ):
-        image_name = "image_case_65_1.png"
+        image_name = "images_with_manifest/image_case_65_1.png"
         cloud_storage_content = [image_name, manifest]
 
         task_spec = {
@@ -1291,8 +1300,11 @@ class TestTaskBackups:
 
     @pytest.mark.with_external_services
     @pytest.mark.parametrize("lightweight_backup", [True, False])
-    def test_can_export_and_import_backup_task_with_cloud_storage(self, tasks, lightweight_backup):
-        cloud_storage_content = ["image_case_65_1.png", "image_case_65_2.png"]
+    def test_can_export_and_import_backup_task_with_cloud_storage(self, lightweight_backup):
+        cloud_storage_content = [
+            "images_with_manifest/image_case_65_1.png",
+            "images_with_manifest/image_case_65_2.png",
+        ]
         task_spec = {
             "name": "Task with files from cloud storage",
             "labels": [
@@ -1314,23 +1326,17 @@ class TestTaskBackups:
         filename = self.tmp_dir / f"cloud_task_{task.id}_backup.zip"
         task.download_backup(filename, lightweight=lightweight_backup)
 
-        assert filename.is_file()
-        assert filename.stat().st_size > 0
+        with zipfile.ZipFile(filename, "r") as zf:
+            files_in_data = {
+                name.split("data/", maxsplit=1)[1]
+                for name in zf.namelist()
+                if name.startswith("data/")
+            }
 
-        if lightweight_backup:
-            with zipfile.ZipFile(filename, "r") as zf:
-                files_in_data = {
-                    name.split("data/", maxsplit=1)[1]
-                    for name in zf.namelist()
-                    if name.startswith("data/")
-                }
-
-            expected_media = {"manifest.jsonl"}
-            if to_bool(os.getenv("CVAT_ALLOW_STATIC_CACHE")):
-                # FIXME: remove extra media files
-                expected_media.update(cloud_storage_content)
-
-            assert files_in_data == expected_media
+        expected_media = {"manifest.jsonl"}
+        if not lightweight_backup:
+            expected_media.update(cloud_storage_content)
+        assert files_in_data == expected_media
 
         self._test_can_restore_task_from_backup(task_id, lightweight_backup=lightweight_backup)
 
@@ -1398,10 +1404,6 @@ class TestTaskBackups:
             assert new_meta["storage"] == ("cloud_storage" if lightweight_backup else "local")
             assert new_meta["cloud_storage_id"] is None
             exclude_regex_paths.extend([r"root\['cloud_storage_id'\]", r"root\['storage'\]"])
-        elif old_meta["cloud_storage_id"] is not None:
-            # static cache
-            assert new_meta["cloud_storage_id"] is None
-            exclude_regex_paths.extend([r"root\['cloud_storage_id'\]"])
 
         assert (
             DeepDiff(

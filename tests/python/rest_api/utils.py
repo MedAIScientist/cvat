@@ -82,10 +82,13 @@ def wait_and_download_v2(
 
     # return downloaded file in case of local downloading
     assert background_request.result_url
-    response = requests.get(
-        background_request.result_url,
-        auth=(api_client.configuration.username, api_client.configuration.password),
-    )
+
+    headers = api_client.get_common_headers()
+    query_params = []
+    api_client.update_params_for_auth(headers=headers, queries=query_params)
+    assert not query_params  # query auth is not expected
+
+    response = requests.get(background_request.result_url, headers=headers)
     assert response.status_code == HTTPStatus.OK, f"Status: {response.status_code}"
     return response.content
 
@@ -510,6 +513,7 @@ def calc_end_frame(start_frame: int, stop_frame: int, frame_step: int) -> int:
 
 
 _T = TypeVar("_T")
+_T2 = TypeVar("_T2")
 
 
 def unique(
@@ -550,9 +554,36 @@ def invite_user_to_org(
         return invitation
 
 
-def get_cloud_storage_content(username: str, cloud_storage_id: int, manifest: Optional[str] = None):
-    with make_api_client(username) as api_client:
-        kwargs = {"manifest_path": manifest} if manifest else {}
+def get_cloud_storage_content(
+    username: str,
+    cloud_storage_id: int,
+    *,
+    manifest: Optional[str] = None,
+    prefix: Optional[str] = None,
+) -> list[str]:
+    kwargs = {}
 
+    if manifest is not None:
+        kwargs["manifest_path"] = manifest
+
+    if prefix is not None:
+        kwargs["prefix"] = prefix
+
+    prefix = (prefix or "").rstrip("/") + "/"
+
+    with make_api_client(username) as api_client:
         (data, _) = api_client.cloudstorages_api.retrieve_content_v2(cloud_storage_id, **kwargs)
-        return [f"{f['name']}{'/' if str(f['type']) == 'DIR' else ''}" for f in data["content"]]
+        return [
+            f"{prefix}{f['name']}{'/' if str(f['type']) == 'DIR' else ''}" for f in data["content"]
+        ]
+
+
+def iter_exclude(
+    it: Iterable[_T], excludes: Iterable[_T2], *, key: Optional[Callable[[_T], _T2]] = None
+) -> Iterable[_T]:
+    excludes = set(excludes)
+
+    if not key:
+        key = lambda v: v
+
+    return (v for v in it if key(v) not in excludes)
