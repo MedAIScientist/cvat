@@ -17,7 +17,7 @@ from copy import copy
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional, Union, cast
+from typing import Any, cast
 
 import django_rq
 from attr.converters import to_bool
@@ -41,7 +41,7 @@ from rest_framework import mixins, serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
 from rest_framework.parsers import MultiPartParser
-from rest_framework.permissions import SAFE_METHODS
+from rest_framework.permissions import SAFE_METHODS, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.settings import api_settings
 from rq.job import Job as RQJob
@@ -57,11 +57,11 @@ from cvat.apps.engine.cache import (
     LockError,
     MediaCache,
 )
+from cvat.apps.engine.cloud_provider import Status as CloudStorageStatus
 from cvat.apps.engine.cloud_provider import db_storage_to_storage_instance
 from cvat.apps.engine.exceptions import CloudStorageMissingError
 from cvat.apps.engine.frame_provider import (
     DataWithMeta,
-    FrameQuality,
     IFrameProvider,
     JobFrameProvider,
     TaskFrameProvider,
@@ -77,6 +77,7 @@ from cvat.apps.engine.models import (
     CloudStorage,
     Comment,
     Data,
+    FrameQuality,
     Issue,
     Job,
     JobType,
@@ -152,7 +153,7 @@ from cvat.apps.engine.view_utils import (
     tus_chunk_action,
 )
 from cvat.apps.iam.filters import ORGANIZATION_OPEN_API_PARAMETERS
-from cvat.apps.iam.permissions import IsAuthenticatedOrReadPublicResource, PolicyEnforcer
+from cvat.apps.iam.permissions import IsAuthenticatedOrReadPublicResource
 from cvat.apps.redis_handler.serializers import RqIdSerializer
 from utils.dataset_manifest import ImageManifestManager
 
@@ -495,7 +496,7 @@ class ProjectViewSet(viewsets.GenericViewSet, mixins.ListModelMixin,
     def preview(self, request: ExtendedRequest, pk: int):
         self._object = self.get_object() # call check_object_permissions as well
 
-        first_task: Optional[models.Task] = self._object.tasks.order_by('-id').first()
+        first_task: models.Task | None = self._object.tasks.order_by('-id').first()
         if not first_task:
             return HttpResponseNotFound('Project image preview not found')
 
@@ -528,7 +529,7 @@ class ProjectViewSet(viewsets.GenericViewSet, mixins.ListModelMixin,
 
 class _DataGetter(metaclass=ABCMeta):
     def __init__(
-        self, data_type: str, data_num: Optional[Union[str, int]], data_quality: str
+        self, data_type: str, data_num: str | int | None, data_quality: str
     ) -> None:
         possible_data_type_values = ('chunk', 'frame', 'preview', 'context_image')
         possible_quality_values = ('compressed', 'original')
@@ -621,7 +622,7 @@ class _TaskDataGetter(_DataGetter):
         *,
         data_type: str,
         data_quality: str,
-        data_num: Optional[Union[str, int]] = None,
+        data_num: str | int | None = None,
     ) -> None:
         super().__init__(data_type=data_type, data_num=data_num, data_quality=data_quality)
         self._db_task = db_task
@@ -642,8 +643,8 @@ class _JobDataGetter(_DataGetter):
         *,
         data_type: str,
         data_quality: str,
-        data_num: Optional[Union[str, int]] = None,
-        data_index: Optional[Union[str, int]] = None,
+        data_num: str | int | None = None,
+        data_index: str | int | None = None,
     ) -> None:
         possible_data_type_values = ('chunk', 'frame', 'preview', 'context_image')
         possible_quality_values = ('compressed', 'original')
@@ -1230,7 +1231,7 @@ class TaskViewSet(viewsets.GenericViewSet, mixins.ListModelMixin,
     @extend_schema(methods=['GET'],
         summary='Get data of a task',
         parameters=[
-            OpenApiParameter('type', location=OpenApiParameter.QUERY, required=False,
+            OpenApiParameter('type', location=OpenApiParameter.QUERY, required=True,
                 type=OpenApiTypes.STR, enum=['chunk', 'frame', 'context_image'],
                 description='Specifies the type of the requested data'),
             OpenApiParameter('quality', location=OpenApiParameter.QUERY, required=False,
@@ -1713,7 +1714,7 @@ class JobViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.CreateMo
         if instance.type != JobType.GROUND_TRUTH:
             raise ValidationError("Only ground truth jobs can be removed")
 
-        validation_layout: Optional[models.ValidationLayout] = getattr(
+        validation_layout: models.ValidationLayout | None = getattr(
             instance.segment.task.data, 'validation_layout', None
         )
         if (validation_layout and validation_layout.mode == models.ValidationMode.GT_POOL):
@@ -1895,7 +1896,7 @@ class JobViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.CreateMo
     @extend_schema(summary='Get data of a job',
         parameters=[
             OpenApiParameter('type', description='Specifies the type of the requested data',
-                location=OpenApiParameter.QUERY, required=False, type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY, required=True, type=OpenApiTypes.STR,
                 enum=['chunk', 'frame', 'context_image']),
             OpenApiParameter('quality', location=OpenApiParameter.QUERY, required=False,
                 type=OpenApiTypes.STR, enum=['compressed', 'original'],
@@ -2551,7 +2552,7 @@ class CloudStorageViewSet(viewsets.GenericViewSet, mixins.ListModelMixin,
 
         provider_type = self.request.query_params.get('provider_type', None)
         if provider_type:
-            if provider_type in CloudProviderChoice.list():
+            if provider_type in CloudProviderChoice.values:
                 return queryset.filter(provider_type=provider_type)
             raise ValidationError('Unsupported type of cloud provider')
         return queryset
@@ -2695,7 +2696,13 @@ class CloudStorageViewSet(viewsets.GenericViewSet, mixins.ListModelMixin,
 
     @extend_schema(summary='Get the status of a cloud storage',
         responses={
-            '200': OpenApiResponse(response=OpenApiTypes.STR, description='Cloud Storage status (AVAILABLE | NOT_FOUND | FORBIDDEN)'),
+            '200': OpenApiResponse(
+                response={
+                    'type': 'string',
+                    'enum': CloudStorageStatus.values(),
+                },
+                description='Cloud Storage Status'
+            ),
         })
     @action(detail=True, methods=['GET'], url_path='status')
     def status(self, request: ExtendedRequest, pk: int):
@@ -2708,9 +2715,6 @@ class CloudStorageViewSet(viewsets.GenericViewSet, mixins.ListModelMixin,
             message = f"Storage {pk} does not exist"
             slogger.glob.error(message)
             return HttpResponseNotFound(message)
-        except Exception as ex:
-            msg = str(ex)
-            return HttpResponseBadRequest(msg)
 
     @extend_schema(summary='Get allowed actions for a cloud storage',
         responses={
@@ -2769,9 +2773,14 @@ class AssetsViewSet(
         super().check_object_permissions(request, obj.guide)
 
     def get_permissions(self):
+        permissions = super().get_permissions()
+
         if self.action == 'retrieve':
-            return [IsAuthenticatedOrReadPublicResource(), PolicyEnforcer()]
-        return super().get_permissions()
+            permissions = [IsAuthenticatedOrReadPublicResource()] + [
+                p for p in permissions if not isinstance(p, IsAuthenticated)
+            ]
+
+        return permissions
 
     def get_serializer_class(self):
         if self.request.method in SAFE_METHODS:

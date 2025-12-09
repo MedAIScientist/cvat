@@ -9,12 +9,12 @@ import itertools
 import os
 import re
 import shutil
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import closing
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Optional, Union
+from typing import Any, NamedTuple
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
@@ -63,12 +63,13 @@ class SegmentParams(NamedTuple):
     start_frame: int
     stop_frame: int
     type: models.SegmentType = models.SegmentType.RANGE
-    frames: Optional[Sequence[int]] = []
+    frames: Sequence[int] | None = []
 
 class SegmentsParams(NamedTuple):
     segments: Iterator[SegmentParams]
     segment_size: int
     overlap: int
+    segments_count: int
 
 def _copy_data_from_share_point(
     server_files: list[str],
@@ -112,8 +113,8 @@ def _copy_data_from_share_point(
 def _generate_segment_params(
     db_task: models.Task,
     *,
-    data_size: Optional[int] = None,
-    job_file_mapping: Optional[JobFileMapping] = None,
+    data_size: int | None = None,
+    job_file_mapping: JobFileMapping | None = None,
 ) -> SegmentsParams:
     if job_file_mapping is not None:
         def _segments():
@@ -134,6 +135,7 @@ def _generate_segment_params(
         segments = _segments()
         segment_size = 0
         overlap = 0
+        segments_count = len(job_file_mapping)
     else:
         # The segments have equal parameters
         if data_size is None:
@@ -148,6 +150,8 @@ def _generate_segment_params(
                 else 5 if db_task.mode == 'interpolation' else 0,
             segment_size // 2,
         )
+        segments_range = range(0, data_size - overlap, segment_size - overlap)
+        segments_count = len(segments_range)
 
         segments = (
             SegmentParams(
@@ -155,24 +159,33 @@ def _generate_segment_params(
                 stop_frame=min(start_frame + segment_size - 1, data_size - 1),
                 type=models.SegmentType.RANGE
             )
-            for start_frame in range(0, data_size - overlap, segment_size - overlap)
+            for start_frame in segments_range
         )
 
-    return SegmentsParams(segments, segment_size, overlap)
+    return SegmentsParams(segments, segment_size, overlap, segments_count)
+
 
 def _create_segments_and_jobs(
     db_task: models.Task,
     *,
     update_status_callback: Callable[[str], None],
-    job_file_mapping: Optional[JobFileMapping] = None,
+    job_file_mapping: JobFileMapping | None = None,
 ):
     update_status_callback('Task is being saved in database')
 
-    segments, segment_size, overlap = _generate_segment_params(
+    segments, segment_size, overlap, segments_count = _generate_segment_params(
         db_task=db_task, job_file_mapping=job_file_mapping,
     )
     db_task.segment_size = segment_size
     db_task.overlap = overlap
+
+    job_count_total = segments_count * (db_task.consensus_replicas + 1)
+    if job_count_total > settings.MAX_JOBS_PER_TASK:
+        raise ValueError(
+            "Too many jobs would be created for the task. "
+            f"Current total: {job_count_total}, "
+            f"maximum allowed: {settings.MAX_JOBS_PER_TASK}."
+        )
 
     for segment_idx, segment_params in enumerate(segments):
         slogger.glob.info(
@@ -198,6 +211,7 @@ def _create_segments_and_jobs(
 
     db_task.data.save()
     db_task.save()
+
 
 def _count_files(data):
     share_root = settings.SHARE_ROOT
@@ -292,7 +306,7 @@ def _validate_data(counter, manifest_files=None):
 
 def _validate_job_file_mapping(
     db_task: models.Task, data: dict[str, Any]
-) -> Optional[JobFileMapping]:
+) -> JobFileMapping | None:
     job_file_mapping = data.get('job_file_mapping', None)
 
     if job_file_mapping is None:
@@ -331,7 +345,7 @@ def _validate_job_file_mapping(
 
 def _validate_validation_params(
     db_task: models.Task, data: dict[str, Any], *, is_backup_restore: bool = False
-) -> Optional[dict[str, Any]]:
+) -> dict[str, Any] | None:
     params = data.get('validation_params', {})
     if not params:
         return None
@@ -370,12 +384,12 @@ def _validate_validation_params(
 
 def _validate_manifest(
     manifests: list[str],
-    root_dir: Optional[str],
+    root_dir: str | None,
     *,
     is_in_cloud: bool,
-    db_cloud_storage: Optional[Any],
+    db_cloud_storage: Any | None,
     is_backup_restore: bool,
-) -> Optional[str]:
+) -> str | None:
     if not manifests:
         return None
 
@@ -582,13 +596,13 @@ def _find_and_filter_related_images(
         for k, k_ris in related_images.items()
     }
 
+
 @transaction.atomic
 def create_thread(
-    db_task: Union[int, models.Task],
+    db_task: int | models.Task,
     data: dict[str, Any],
     *,
     is_backup_restore: bool = False,
-    is_dataset_import: bool = False,
 ) -> None:
     if isinstance(db_task, int):
         db_task = models.Task.objects.select_for_update().get(pk=db_task)
@@ -612,7 +626,7 @@ def create_thread(
     upload_dir = db_data.get_upload_dirname() if db_data.storage != models.StorageChoice.SHARE else settings.SHARE_ROOT
     is_data_in_cloud = db_data.storage == models.StorageChoice.CLOUD_STORAGE
 
-    if data['remote_files'] and not is_dataset_import:
+    if data['remote_files']:
         data['remote_files'] = _download_data(data['remote_files'], upload_dir, update_status_callback=update_status)
 
     # find and validate manifest file
@@ -764,24 +778,11 @@ def create_thread(
         ):
             update_status("Downloading input media")
 
-            filtered_data = []
-            for files in (i for i in media.values() if i):
-                filtered_data.extend(files)
-            media_to_download = filtered_data
-
-            if media['image']:
-                start_frame = db_data.start_frame
-                stop_frame = len(filtered_data) - 1
-                if data['stop_frame'] is not None:
-                    stop_frame = min(stop_frame, data['stop_frame'])
-
-                step = db_data.get_frame_step()
-                if start_frame or step != 1 or stop_frame != len(filtered_data) - 1:
-                    media_to_download = filtered_data[start_frame : stop_frame + 1: step]
-
-            _download_data_from_cloud_storage(db_data.cloud_storage, media_to_download, upload_dir)
-            del media_to_download
-            del filtered_data
+            _download_data_from_cloud_storage(
+                db_storage=db_data.cloud_storage,
+                files=list(itertools.chain.from_iterable(media.values())),
+                upload_dir=upload_dir,
+            )
 
             is_data_in_cloud = False
             if is_packed_media:
@@ -862,7 +863,7 @@ def create_thread(
         )
 
     # Extract input data
-    extractor: Optional[IMediaReader] = None
+    extractor: IMediaReader | None = None
     manifest_index = _get_manifest_frame_indexer()
     for media_type, media_files in media.items():
         if not media_files:
@@ -871,7 +872,7 @@ def create_thread(
         if extractor is not None:
             raise ValidationError('Combined data types are not supported')
 
-        if (is_dataset_import or is_backup_restore) and media_type == 'image' and db_data.storage == models.StorageChoice.SHARE:
+        if is_backup_restore and media_type == 'image' and db_data.storage == models.StorageChoice.SHARE:
             manifest_index = _get_manifest_frame_indexer(db_data.start_frame, db_data.get_frame_step())
             db_data.start_frame = 0
             data['stop_frame'] = None
@@ -960,7 +961,6 @@ def create_thread(
             db_data.storage_method == models.StorageMethodChoice.CACHE and
             db_data.sorting_method in {models.SortingMethod.RANDOM, models.SortingMethod.PREDEFINED}
         ) or (
-            not is_dataset_import and
             not is_backup_restore and
             data['sorting_method'] == models.SortingMethod.PREDEFINED and (
                 # Sorting with manifest is required for zip
@@ -1133,6 +1133,10 @@ def create_thread(
 
             manifest = ImageManifestManager(db_data.get_manifest_path())
             if not manifest.exists:
+                # TODO: Try to avoid adding manifest entries for images that are not in
+                # extractor.frame_range. In addition to less processing here, it would also allow
+                # us to avoid downloading such images from cloud storage (when using static chunks),
+                # or copying them from the attached share (when using copy_data).
                 manifest.link(
                     sources=extractor.absolute_source_paths,
                     meta={
@@ -1605,14 +1609,14 @@ def _create_static_chunks(db_task: models.Task, *, media_extractor: IMediaReader
         fs_original = executor.submit(
             original_chunk_writer.save_as_chunk,
             images=chunk_data,
-            chunk_path=db_data.get_original_segment_chunk_path(
-                chunk_idx, segment_id=db_segment.id
+            chunk_path=db_data.get_static_segment_chunk_path(
+                chunk_idx, segment_id=db_segment.id, quality=models.FrameQuality.ORIGINAL
             ),
         )
         compressed_chunk_writer.save_as_chunk(
             images=chunk_data,
-            chunk_path=db_data.get_compressed_segment_chunk_path(
-                chunk_idx, segment_id=db_segment.id
+            chunk_path=db_data.get_static_segment_chunk_path(
+                chunk_idx, segment_id=db_segment.id, quality=models.FrameQuality.COMPRESSED
             ),
         )
 
@@ -1636,13 +1640,12 @@ def _create_static_chunks(db_task: models.Task, *, media_extractor: IMediaReader
         original_chunk_writer_class = ZipChunkWriter
         original_quality = 100
 
-    chunk_writer_kwargs = {}
-    if db_task.dimension == models.DimensionType.DIM_3D:
-        chunk_writer_kwargs["dimension"] = db_task.dimension
     compressed_chunk_writer = compressed_chunk_writer_class(
-        db_data.image_quality, **chunk_writer_kwargs
+        quality=db_data.image_quality, dimension=db_task.dimension
     )
-    original_chunk_writer = original_chunk_writer_class(original_quality, **chunk_writer_kwargs)
+    original_chunk_writer = original_chunk_writer_class(
+        quality=original_quality, dimension=db_task.dimension
+    )
 
     db_segments = db_task.segment_set.order_by('start_frame').all()
 
