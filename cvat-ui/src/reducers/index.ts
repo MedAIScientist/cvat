@@ -805,6 +805,7 @@ export enum NavigationType {
     REGULAR = 'regular',
     FILTERED = 'filtered',
     EMPTY = 'empty',
+    CHAPTER = 'chapter',
 }
 
 export interface EditingState {
@@ -875,6 +876,7 @@ export interface AnnotationState {
         navigationBlocked: boolean;
         playing: boolean;
         frameAngles: number[];
+        hoveredChapter: number | null;
     };
     drawing: {
         activeInteractor?: MLModel | OpenCVTool;
@@ -987,7 +989,7 @@ export interface PlayerSettingsState {
 export interface WorkspaceSettingsState {
     autoSave: boolean;
     autoSaveInterval: number; // in ms
-    aamZoomMargin: number;
+    focusedObjectPadding: number;
     automaticBordering: boolean;
     adaptiveZoom: boolean;
     showObjectsTextAlways: boolean;

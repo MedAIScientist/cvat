@@ -14,7 +14,7 @@ from contextlib import closing
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypeAlias
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
@@ -57,7 +57,7 @@ from .cloud_provider import HeaderFirstMediaDownloader, db_storage_to_storage_in
 
 slogger = ServerLogManager(__name__)
 
-JobFileMapping = list[list[str]]
+JobFileMapping: TypeAlias = list[list[str]]
 
 class SegmentParams(NamedTuple):
     start_frame: int
@@ -221,8 +221,7 @@ def _count_files(data):
         path = os.path.normpath(path).lstrip('/')
         if '..' in path.split(os.path.sep):
             raise ValueError("Don't use '..' inside file paths")
-        full_path = os.path.abspath(os.path.join(share_root, path))
-        if os.path.commonprefix([share_root, full_path]) != share_root:
+        if not (share_root / path).resolve().is_relative_to(share_root):
             raise ValueError("Bad file path: " + path)
         server_files.append(path)
 
@@ -466,9 +465,6 @@ def _download_data_from_cloud_storage(
     cloud_storage_instance = db_storage_to_storage_instance(db_storage)
     cloud_storage_instance.bulk_download_to_dir(files, upload_dir)
 
-def _get_manifest_frame_indexer(start_frame=0, frame_step=1):
-    return lambda frame_id: start_frame + frame_id * frame_step
-
 def _read_dataset_manifest(path: str, *, create_index: bool = False) -> ImageManifestManager:
     """
     Reads an upload manifest file
@@ -571,6 +567,7 @@ def _create_task_manifest_from_cloud_data(
         },
         DIM_3D=(dimension == models.DimensionType.DIM_3D),
         stop=len(sorted_media) - 1,
+        data_dir=".",
     )
     manifest.create()
 
@@ -864,19 +861,12 @@ def create_thread(
 
     # Extract input data
     extractor: IMediaReader | None = None
-    manifest_index = _get_manifest_frame_indexer()
     for media_type, media_files in media.items():
         if not media_files:
             continue
 
         if extractor is not None:
             raise ValidationError('Combined data types are not supported')
-
-        if is_backup_restore and media_type == 'image' and db_data.storage == models.StorageChoice.SHARE:
-            manifest_index = _get_manifest_frame_indexer(db_data.start_frame, db_data.get_frame_step())
-            db_data.start_frame = 0
-            data['stop_frame'] = None
-            db_data.frame_filter = ''
 
         source_paths = [os.path.join(upload_dir, f) for f in media_files]
 
@@ -989,7 +979,7 @@ def create_thread(
                     )
 
                 manifest = _read_dataset_manifest(os.path.join(manifest_root, manifest_file),
-                    create_index=manifest_root.startswith(db_data.get_upload_dirname())
+                    create_index=manifest_root.is_relative_to(db_data.get_upload_dirname())
                 )
 
             sorted_media_files = _restore_file_order_from_manifest(extractor, manifest, upload_dir)
@@ -1038,7 +1028,7 @@ def create_thread(
     if (manifest_file and not os.path.exists(db_data.get_manifest_path())):
         shutil.copyfile(os.path.join(manifest_root, manifest_file),
             db_data.get_manifest_path())
-        if manifest_root and manifest_root.startswith(db_data.get_upload_dirname()):
+        if manifest_root and manifest_root.is_relative_to(db_data.get_upload_dirname()):
             os.remove(os.path.join(manifest_root, manifest_file))
         manifest_file = os.path.relpath(db_data.get_manifest_path(), upload_dir)
 
@@ -1088,8 +1078,7 @@ def create_thread(
                     # TODO: maybe generate manifest in a temp directory
                     manifest = VideoManifestManager(db_data.get_manifest_path())
                     manifest.link(
-                        media_file=media_files[0],
-                        upload_dir=upload_dir,
+                        media_file=Path(upload_dir, media_files[0]),
                         chunk_size=db_data.chunk_size, # TODO: why it's needed here?
                         force=True
                     )
@@ -1138,7 +1127,7 @@ def create_thread(
                 # us to avoid downloading such images from cloud storage (when using static chunks),
                 # or copying them from the attached share (when using copy_data).
                 manifest.link(
-                    sources=extractor.absolute_source_paths,
+                    sources=list(map(Path, extractor.absolute_source_paths)),
                     meta={
                         k: {'related_images': related_images[k] }
                         for k in related_images
@@ -1155,7 +1144,7 @@ def create_thread(
                 image_size = None
 
                 if manifest:
-                    image_info = manifest[manifest_index(frame_id)]
+                    image_info = manifest[frame_id]
 
                     # check mapping
                     if not image_path.endswith(f"{image_info['name']}{image_info['extension']}"):
